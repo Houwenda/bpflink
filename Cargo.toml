@@ -1,0 +1,39 @@
+[package]
+name = "bpflink"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "BPF-backed userspace UDP transport experiments"
+readme = "README.md"
+repository = "https://github.com/Houwenda/bpflink"
+keywords = ["bpf", "smoltcp", "kcp", "macos", "transport"]
+categories = ["asynchronous", "network-programming"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    "README.md",
+    "CHANGELOG.md",
+    "RELEASE.md",
+    "docs/macos-validation.md",
+    "docs/linux-validation.md",
+    "examples/**/*.rs",
+    "src/**/*.rs",
+    "tests/**/*.rs",
+]
+
+[features]
+default = []
+test-util = []
+
+[dependencies]
+bytes = "1"
+kcp-core = "0.3"
+libc = "0.2"
+smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "proto-ipv6", "socket-udp"] }
+thiserror = "1"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "rt", "rt-multi-thread", "sync", "time"] }
