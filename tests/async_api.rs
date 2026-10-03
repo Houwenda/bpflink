@@ -1,8 +1,9 @@
 #![cfg(feature = "test-util")]
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
-use bpflink::{Error, Link, PeerAddr, TestCommand};
+use bpflink::{BpfUdpPacket, Error, Link, PeerAddr, TestCommand};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn peer() -> PeerAddr {
@@ -226,4 +227,54 @@ async fn link_shutdown_closes_listener_and_stream_handles() {
     assert_eq!(server.read(&mut buf).await.unwrap(), 0);
     let err = client.write_all(b"after shutdown").await.unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+}
+
+#[tokio::test]
+async fn udp_socket_recv_timeout_and_close_wake_pending_receives() {
+    let link = Link::new_for_test_with_service_ports([53002]);
+    let socket = link.udp_socket(53002).await.unwrap();
+
+    let timeout = socket.recv_from_timeout(Duration::from_millis(1)).await;
+    assert!(matches!(timeout, Err(Error::Timeout)));
+
+    let waiting = socket.clone();
+    let recv_task = tokio::spawn(async move { waiting.recv_from().await });
+    tokio::task::yield_now().await;
+    socket.close();
+
+    let err = recv_task.await.unwrap().unwrap_err();
+    assert!(matches!(err, Error::LinkClosed));
+}
+
+#[tokio::test]
+async fn udp_socket_receives_injected_datagrams_in_order() {
+    let link = Link::new_for_test_with_service_ports([53003]);
+    let socket = link.udp_socket(53003).await.unwrap();
+    let first: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let second: SocketAddr = "192.0.2.54:53".parse().unwrap();
+
+    link.inject_udp_datagram_for_test(
+        53003,
+        BpfUdpPacket {
+            source: first,
+            payload: b"first".to_vec(),
+        },
+    )
+    .unwrap();
+    link.inject_udp_datagram_for_test(
+        53003,
+        BpfUdpPacket {
+            source: second,
+            payload: b"second".to_vec(),
+        },
+    )
+    .unwrap();
+
+    let first_packet = socket.recv_from().await.unwrap();
+    let second_packet = socket.recv_from().await.unwrap();
+
+    assert_eq!(first_packet.source, first);
+    assert_eq!(first_packet.payload, b"first");
+    assert_eq!(second_packet.source, second);
+    assert_eq!(second_packet.payload, b"second");
 }

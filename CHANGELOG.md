@@ -11,6 +11,7 @@ Initial macOS/Linux validation release candidate.
 - BPF-backed runtime for Darwin `/dev/bpf*` with interface-name binding.
 - smoltcp Ethernet/ARP/NDP/IPv4/IPv6/UDP stack boundary.
 - TCP-like async public API: `Link`, `BpfStream`, and `BpfListener`.
+- Raw UDP datagram public API: `BpfUdpSocket` and `BpfUdpPacket`.
 - Structured runtime configuration through `LinkConfig`, including validation
   before opening a packet backend.
 - Build-time service-port sets via `LinkBuilder::service_ports([...])`; a
@@ -31,7 +32,8 @@ Initial macOS/Linux validation release candidate.
   matching IPv4/IPv6 UDP traffic. The first release supports up to 16 service
   ports per `Link`.
 - Diagnostics and smoke examples for BPF device setup, runtime command loop,
-  echo validation, and nc-like manual transfer.
+  echo validation, nc-like manual transfer, and DNS UDP request/response
+  checks.
 - Runtime diagnostics use the same build-time service-port set model as
   `LinkBuilder::service_ports([...])`, with a separate active probe port.
 - Linux `AF_PACKET/SOCK_RAW` packet I/O backend with classic BPF

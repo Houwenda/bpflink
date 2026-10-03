@@ -2,10 +2,11 @@
 
 `bpflink` is a Rust crate for building TCP-like async byte streams on top of a
 BPF-backed userspace network stack. It owns a real link-layer packet interface,
-runs smoltcp for Ethernet/IP/UDP, and carries bpflink stream frames inside UDP.
+runs smoltcp for Ethernet/IP/UDP, and carries bpflink stream frames or raw
+datagrams inside UDP.
 
 The public API is intentionally small: create one `Link` for an interface, then
-create `BpfListener` and `BpfStream` handles from it.
+create `BpfListener`, `BpfStream`, or `BpfUdpSocket` handles from it.
 
 ## Architecture
 
@@ -13,13 +14,13 @@ create `BpfListener` and `BpfStream` handles from it.
 flowchart LR
     app["application code"]
     link["Link"]
-    handles["BpfListener / BpfStream"]
+    handles["BpfListener / BpfStream / BpfUdpSocket"]
     runtime["runtime thread"]
     transport["KCP transport\n(simple fallback)"]
     stack["smoltcp\nEthernet + IPv4/IPv6 + UDP"]
     macos["macOS\n/dev/bpf*"]
     linux["Linux\nAF_PACKET + SO_ATTACH_FILTER"]
-    wire["Ethernet frames\nUDP payload = bpflink frames"]
+    wire["Ethernet frames\nUDP payload = stream frames or raw datagrams"]
 
     app --> link
     link --> handles
@@ -32,15 +33,16 @@ flowchart LR
     linux <--> wire
 ```
 
-`Link` is the owner of the packet backend and runtime. Streams and listeners are
-lightweight async handles; they do not open their own BPF device or packet
-socket. This lets multiple streams share one interface binding, one smoltcp
-stack, and one transport runtime.
+`Link` is the owner of the packet backend and runtime. Streams, listeners, and
+UDP sockets are lightweight async handles; they do not open their own BPF device
+or packet socket. This lets multiple handles share one interface binding, one
+smoltcp stack, and one transport runtime.
 
 ## What It Provides
 
 - TCP-like async API: `Link`, `BpfListener`, and `BpfStream`.
 - `tokio::io::AsyncRead` and `AsyncWrite` for stream I/O.
+- Raw UDP datagram API: `BpfUdpSocket` and `BpfUdpPacket`.
 - Structured runtime configuration through `LinkConfig`, or direct fluent setup
   through `Link::builder()`.
 - Explicit lifecycle API: `Link::shutdown`, `Link::close`, and
@@ -64,7 +66,7 @@ stack, and one transport runtime.
 - A practical diagnostic path for isolating whether macOS on-device network
   enforcement is interfering with a transport experiment.
 - Diagnostics helpers and examples for BPF setup, runtime smoke, echo testing,
-  and nc-like manual transfer.
+  nc-like manual transfer, and DNS UDP request/response checks.
 
 ## Supported Platforms
 
@@ -347,6 +349,18 @@ is launched from a non-interactive SSH command or with stdin already at EOF, it
 will close its stream direction and the peer can see a normal broken-pipe style
 close while still typing. Use `--send-only` and `--recv-only` for one-way
 transfer.
+
+Resolve A/AAAA records through a selected DNS server over the BPF UDP path:
+
+```bash
+cargo run --example dns_resolver -- \
+  --interface en0 \
+  --local-ip <client-ip> \
+  --local-port 53000 \
+  --dns-server <dns-server-ip> \
+  --name example.com \
+  --type both
+```
 
 ## Verification
 

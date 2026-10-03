@@ -43,7 +43,7 @@ mod transport;
 
 pub use error::{Error, Result};
 pub use link::{parse_scoped_ip, Link, LinkBuilder, LinkConfig, LinkStats, PeerAddr};
-pub use socket::{BpfListener, BpfStream};
+pub use socket::{BpfListener, BpfStream, BpfUdpPacket, BpfUdpSocket};
 pub use transport::TransportMode;
 
 #[cfg(feature = "test-util")]
