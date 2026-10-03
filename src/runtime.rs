@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 #[cfg(feature = "test-util")]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "test-util")]
@@ -15,7 +15,9 @@ use tokio::sync::oneshot;
 #[cfg(feature = "test-util")]
 use crate::link::LinkStats;
 use crate::link::PeerAddr;
-use crate::socket::{BpfListener, BpfStream, StreamReadHandle};
+use crate::socket::{
+    BpfListener, BpfStream, BpfUdpPacket, BpfUdpSocket, StreamReadHandle, UdpDeliveryHandle,
+};
 use crate::stack::smoltcp_driver::{PollOutcome, StackConfig, StackDriver};
 use crate::transport::KcpTransportEngine;
 use crate::transport::{
@@ -29,12 +31,35 @@ use crate::bpf::FrameIo;
 #[cfg(feature = "test-util")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TestCommand {
-    Listen { service_port: u16 },
-    Connect { peer: PeerAddr, service_port: u16 },
-    StreamWrite { session_id: u64, len: usize },
-    StreamReadPoll { session_id: u64 },
-    Close { session_id: u64 },
-    Abort { session_id: u64 },
+    Listen {
+        service_port: u16,
+    },
+    Connect {
+        peer: PeerAddr,
+        service_port: u16,
+    },
+    UdpSocket {
+        service_port: u16,
+    },
+    UdpSend {
+        service_port: u16,
+        peer: PeerAddr,
+        peer_port: u16,
+        len: usize,
+    },
+    StreamWrite {
+        session_id: u64,
+        len: usize,
+    },
+    StreamReadPoll {
+        session_id: u64,
+    },
+    Close {
+        session_id: u64,
+    },
+    Abort {
+        session_id: u64,
+    },
     Shutdown,
 }
 
@@ -78,6 +103,11 @@ pub(crate) struct RuntimeStreamHandle {
     sender: mpsc::Sender<DriverCommand>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RuntimeUdpHandle {
+    sender: mpsc::Sender<DriverCommand>,
+}
+
 impl RuntimeStreamHandle {
     fn new(sender: mpsc::Sender<DriverCommand>) -> Self {
         Self { sender }
@@ -112,6 +142,32 @@ impl RuntimeStreamHandle {
         let (reply, receiver) = oneshot::channel();
         self.sender
             .send(DriverCommand::Abort { session_id, reply })
+            .map_err(|_| Error::LinkClosed)?;
+        receiver.await.map_err(|_| Error::LinkClosed)?
+    }
+}
+
+impl RuntimeUdpHandle {
+    fn new(sender: mpsc::Sender<DriverCommand>) -> Self {
+        Self { sender }
+    }
+
+    pub(crate) async fn send_to(
+        &self,
+        service_port: u16,
+        peer: PeerAddr,
+        peer_port: u16,
+        payload: &[u8],
+    ) -> Result<()> {
+        let (reply, receiver) = oneshot::channel();
+        self.sender
+            .send(DriverCommand::UdpSend {
+                service_port,
+                peer,
+                peer_port,
+                payload: payload.to_vec(),
+                reply,
+            })
             .map_err(|_| Error::LinkClosed)?;
         receiver.await.map_err(|_| Error::LinkClosed)?
     }
@@ -221,6 +277,19 @@ impl RuntimeDriver {
         Ok(stream)
     }
 
+    pub(crate) async fn udp_socket(&self, service_port: u16) -> Result<BpfUdpSocket> {
+        let (socket, delivery) =
+            BpfUdpSocket::new_runtime(service_port, RuntimeUdpHandle::new(self.sender.clone()));
+        let (reply, receiver) = oneshot::channel();
+        self.send(DriverCommand::RegisterUdpSocket {
+            service_port,
+            delivery,
+            reply,
+        })?;
+        receiver.await.map_err(|_| Error::DriverClosed)??;
+        Ok(socket)
+    }
+
     pub(crate) async fn snapshot(&self) -> Result<RuntimeSnapshot> {
         let (reply, receiver) = oneshot::channel();
         self.send(DriverCommand::Snapshot { reply })?;
@@ -282,6 +351,18 @@ enum DriverCommand {
         session_id: u64,
         read_handle: StreamReadHandle,
     },
+    RegisterUdpSocket {
+        service_port: u16,
+        delivery: UdpDeliveryHandle,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    UdpSend {
+        service_port: u16,
+        peer: PeerAddr,
+        peer_port: u16,
+        payload: Vec<u8>,
+        reply: oneshot::Sender<Result<()>>,
+    },
     Snapshot {
         reply: oneshot::Sender<RuntimeSnapshot>,
     },
@@ -315,6 +396,7 @@ struct DriverState<D: FrameIo> {
     filter_configured: Option<bool>,
     transport_mode: TransportMode,
     listeners: HashMap<u16, BpfListener>,
+    udp_sockets: HashMap<u16, UdpDeliveryHandle>,
     sessions: HashMap<u64, RuntimeSession>,
     next_stream_id: u64,
     command_count: usize,
@@ -355,6 +437,7 @@ impl<D: FrameIo> DriverState<D> {
             filter_configured: config.filter_configured,
             transport_mode: config.transport_mode,
             listeners: HashMap::new(),
+            udp_sockets: HashMap::new(),
             sessions: HashMap::new(),
             next_stream_id: 1,
             command_count: 0,
@@ -379,6 +462,30 @@ impl<D: FrameIo> DriverState<D> {
             .or_insert_with(|| BpfListener::new(service_port))
             .clone();
         Ok(listener)
+    }
+
+    fn register_udp_socket(
+        &mut self,
+        service_port: u16,
+        delivery: UdpDeliveryHandle,
+    ) -> Result<()> {
+        self.ensure_service_port(service_port)?;
+        self.udp_sockets.insert(service_port, delivery);
+        Ok(())
+    }
+
+    fn udp_send(
+        &mut self,
+        service_port: u16,
+        peer: PeerAddr,
+        peer_port: u16,
+        payload: &[u8],
+    ) -> Result<()> {
+        self.ensure_service_port(service_port)?;
+        self.stack
+            .send_udp(service_port, peer.ip, peer_port, payload)?;
+        self.outbound_datagram_count += 1;
+        Ok(())
     }
 
     fn connect(
@@ -510,6 +617,10 @@ impl<D: FrameIo> DriverState<D> {
             listener.close();
         }
         self.listeners.clear();
+        for socket in self.udp_sockets.values() {
+            socket.close();
+        }
+        self.udp_sockets.clear();
 
         let session_ids: Vec<u64> = self.sessions.keys().copied().collect();
         for session_id in session_ids {
@@ -605,13 +716,24 @@ impl<D: FrameIo> DriverState<D> {
         datagram: &[u8],
         now: Instant,
     ) -> Result<()> {
-        let (header, payload) = BpflinkHeader::decode(datagram)?;
-        if header.service_port != service_port {
-            return Ok(());
+        if let Ok((header, payload)) = BpflinkHeader::decode(datagram) {
+            if header.service_port == service_port {
+                return match header.packet_type {
+                    PacketType::Connect => self.accept_inbound(src, src_port, header, payload, now),
+                    _ => self.dispatch_session_packet(src, src_port, header, payload, now),
+                };
+            }
         }
-        match header.packet_type {
-            PacketType::Connect => self.accept_inbound(src, src_port, header, payload, now),
-            _ => self.dispatch_session_packet(src, src_port, header, payload, now),
+        self.dispatch_raw_udp(src, src_port, service_port, datagram);
+        Ok(())
+    }
+
+    fn dispatch_raw_udp(&mut self, src: IpAddr, src_port: u16, service_port: u16, datagram: &[u8]) {
+        if let Some(socket) = self.udp_sockets.get(&service_port) {
+            socket.push_packet(BpfUdpPacket {
+                source: SocketAddr::new(src, src_port),
+                payload: datagram.to_vec(),
+            });
         }
     }
 
@@ -825,6 +947,24 @@ fn handle_command<D: FrameIo>(
             state.attach_read_handle(session_id, read_handle);
             true
         }
+        DriverCommand::RegisterUdpSocket {
+            service_port,
+            delivery,
+            reply,
+        } => {
+            let _ = reply.send(state.register_udp_socket(service_port, delivery));
+            true
+        }
+        DriverCommand::UdpSend {
+            service_port,
+            peer,
+            peer_port,
+            payload,
+            reply,
+        } => {
+            let _ = reply.send(state.udp_send(service_port, peer, peer_port, &payload));
+            true
+        }
         DriverCommand::Snapshot { reply } => {
             let _ = reply.send(state.snapshot());
             true
@@ -862,6 +1002,7 @@ fn error_to_io(error: Error) -> std::io::Error {
 pub(crate) struct TestDriver {
     commands: Arc<Mutex<Vec<TestCommand>>>,
     listeners: Arc<Mutex<HashMap<u16, BpfListener>>>,
+    udp_sockets: Arc<Mutex<HashMap<u16, UdpDeliveryHandle>>>,
     stream_close_handles: Arc<Mutex<Vec<StreamReadHandle>>>,
     service_ports: Vec<u16>,
     next_session_id: Arc<AtomicU64>,
@@ -873,6 +1014,7 @@ impl Default for TestDriver {
         Self {
             commands: Arc::new(Mutex::new(Vec::new())),
             listeners: Arc::new(Mutex::new(HashMap::new())),
+            udp_sockets: Arc::new(Mutex::new(HashMap::new())),
             stream_close_handles: Arc::new(Mutex::new(Vec::new())),
             service_ports: Vec::new(),
             next_session_id: Arc::new(AtomicU64::new(1)),
@@ -939,6 +1081,32 @@ impl TestDriver {
         Ok(client)
     }
 
+    pub(crate) fn udp_socket(&self, service_port: u16) -> Result<BpfUdpSocket> {
+        self.record(TestCommand::UdpSocket { service_port });
+        let (socket, delivery) = BpfUdpSocket::new_for_test(service_port, self.commands.clone());
+        self.udp_sockets
+            .lock()
+            .expect("test driver udp sockets poisoned")
+            .insert(service_port, delivery);
+        Ok(socket)
+    }
+
+    pub(crate) fn inject_udp_datagram(
+        &self,
+        service_port: u16,
+        packet: BpfUdpPacket,
+    ) -> Result<()> {
+        let socket = self
+            .udp_sockets
+            .lock()
+            .expect("test driver udp sockets poisoned")
+            .get(&service_port)
+            .cloned()
+            .ok_or(Error::DriverClosed)?;
+        socket.push_packet(packet);
+        Ok(())
+    }
+
     pub(crate) fn shutdown(&self) {
         self.record(TestCommand::Shutdown);
         for listener in self
@@ -948,6 +1116,14 @@ impl TestDriver {
             .values()
         {
             listener.close();
+        }
+        for socket in self
+            .udp_sockets
+            .lock()
+            .expect("test driver udp sockets poisoned")
+            .values()
+        {
+            socket.close();
         }
         for handle in self
             .stream_close_handles
@@ -1504,6 +1680,89 @@ mod tests {
         let snapshot = driver.snapshot().await.expect("snapshot succeeds");
         assert_eq!(snapshot.service_ports, vec![40000, service_port]);
         assert_eq!(snapshot.inbound_accept_count, 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_routes_raw_udp_to_udp_socket() {
+        let local_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let peer_ip = Ipv4Addr::new(10, 0, 0, 53);
+        let service_port = 53000;
+        let stats = Arc::new(Mutex::new(FakeStats {
+            readable: vec![udp_frame(
+                peer_ip,
+                local_ip,
+                53,
+                service_port,
+                b"dns response".to_vec(),
+            )],
+            ..FakeStats::default()
+        }));
+        let driver = super::RuntimeDriver::spawn_with_device(
+            FakeFrameIo::new(stats),
+            StackConfig {
+                local_ip: local_ip.into(),
+                local_prefix_len: 24,
+                default_gateway: None,
+                service_ports: vec![service_port],
+                ethernet_addr: EthernetAddress([0x02, 0, 0, 0, 0, 1]),
+            },
+        )
+        .expect("runtime driver starts");
+        let socket = driver
+            .udp_socket(service_port)
+            .await
+            .expect("udp socket registers");
+
+        let packet = tokio::time::timeout(Duration::from_secs(1), socket.recv_from())
+            .await
+            .expect("udp receive wakes")
+            .expect("udp packet");
+
+        assert_eq!(packet.source, std::net::SocketAddr::from((peer_ip, 53)));
+        assert_eq!(packet.payload, b"dns response");
+    }
+
+    #[tokio::test]
+    async fn runtime_keeps_bpflink_frames_on_stream_path() {
+        let local_ip = Ipv4Addr::new(10, 0, 0, 1);
+        let peer_ip = Ipv4Addr::new(10, 0, 0, 2);
+        let service_port = 40000;
+        let connection_id = 0x1122_3344_5566_7788;
+        let stats = Arc::new(Mutex::new(FakeStats {
+            readable: vec![udp_frame(
+                peer_ip,
+                local_ip,
+                50000,
+                service_port,
+                bpflink_datagram(PacketType::Connect, service_port, connection_id, 0, b""),
+            )],
+            ..FakeStats::default()
+        }));
+        let driver = super::RuntimeDriver::spawn_with_device(
+            FakeFrameIo::new(stats),
+            StackConfig {
+                local_ip: local_ip.into(),
+                local_prefix_len: 24,
+                default_gateway: None,
+                service_ports: vec![service_port],
+                ethernet_addr: EthernetAddress([0x02, 0, 0, 0, 0, 1]),
+            },
+        )
+        .expect("runtime driver starts");
+        let listener = driver.listen(service_port).await.expect("listen succeeds");
+        let socket = driver
+            .udp_socket(service_port)
+            .await
+            .expect("udp socket registers");
+
+        let accepted = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("accept wakes")
+            .expect("accepted stream");
+        let raw = socket.recv_from_timeout(Duration::from_millis(1)).await;
+
+        assert_eq!(accepted.service_port(), service_port);
+        assert!(matches!(raw, Err(Error::Timeout)));
     }
 
     #[tokio::test]

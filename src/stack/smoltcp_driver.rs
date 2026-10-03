@@ -10,7 +10,6 @@ use smoltcp::wire::{
 
 use crate::bpf::filter::normalize_service_ports;
 use crate::bpf::FrameIo;
-use crate::transport::BpflinkHeader;
 use crate::{Error, Result};
 
 use super::device::StackDevice;
@@ -106,9 +105,6 @@ impl<D: FrameIo> StackDriver<D> {
             match socket.recv_slice(&mut payload) {
                 Ok((len, meta)) => {
                     payload.truncate(len);
-                    if !is_valid_bpflink_udp_payload(&payload, *service_port) {
-                        continue;
-                    }
                     let src = match meta.endpoint.addr {
                         IpAddress::Ipv4(addr) => StdIpAddr::V4(addr.octets().into()),
                         IpAddress::Ipv6(addr) => StdIpAddr::V6(addr.octets().into()),
@@ -173,12 +169,6 @@ impl<D: FrameIo> StackDriver<D> {
         }
         Ok(())
     }
-}
-
-fn is_valid_bpflink_udp_payload(payload: &[u8], service_port: u16) -> bool {
-    BpflinkHeader::decode(payload)
-        .map(|(header, _)| header.service_port == service_port)
-        .unwrap_or(false)
 }
 
 fn smoltcp_ipv6(addr: std::net::Ipv6Addr) -> Ipv6Address {
@@ -247,23 +237,6 @@ mod tests {
         fn mtu(&self) -> usize {
             1500
         }
-    }
-
-    #[test]
-    fn driver_accepts_only_valid_bpflink_udp_payloads() {
-        let mut valid = Vec::new();
-        BpflinkHeader {
-            packet_type: PacketType::Data,
-            service_port: 40000,
-            connection_id: 1,
-            stream_id: 0,
-        }
-        .encode(b"hello", &mut valid)
-        .unwrap();
-
-        assert!(super::is_valid_bpflink_udp_payload(&valid, 40000));
-        assert!(!super::is_valid_bpflink_udp_payload(&valid, 40001));
-        assert!(!super::is_valid_bpflink_udp_payload(b"not bpflink", 40000));
     }
 
     #[test]
@@ -386,6 +359,51 @@ mod tests {
         }
 
         assert_eq!(received, 16);
+    }
+
+    #[test]
+    fn poll_accepts_raw_udp_payloads_on_configured_ports() {
+        let local_ip = "192.0.2.1".parse().unwrap();
+        let peer_ip = "192.0.2.53".parse().unwrap();
+        let service_port = 53000;
+        let readable = vec![udp_frame(
+            peer_ip,
+            local_ip,
+            53,
+            service_port,
+            b"dns response".to_vec(),
+        )];
+        let fake = FakeFrameIo {
+            stats: Arc::new(Mutex::new(FakeStats {
+                readable,
+                ..FakeStats::default()
+            })),
+        };
+        let mut driver = super::StackDriver::new(
+            super::StackConfig {
+                local_ip: local_ip.into(),
+                local_prefix_len: 24,
+                default_gateway: None,
+                service_ports: vec![service_port],
+                ethernet_addr: EthernetAddress([0x02, 0, 0, 0, 0, 1]),
+            },
+            fake,
+        )
+        .expect("stack driver starts");
+
+        let outcome = driver
+            .poll(smoltcp::time::Instant::from_millis(0))
+            .expect("poll succeeds");
+
+        assert!(matches!(
+            outcome,
+            super::PollOutcome::ReceivedUdp {
+                src: IpAddr::V4(src),
+                src_port: 53,
+                service_port: 53000,
+                payload,
+            } if src == peer_ip && payload == b"dns response"
+        ));
     }
 
     #[test]

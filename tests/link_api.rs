@@ -1,10 +1,11 @@
 #![cfg(feature = "test-util")]
 
+use std::net::SocketAddr;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
-use bpflink::TransportMode;
 use bpflink::{parse_scoped_ip, Error, Link, LinkConfig, PeerAddr, TestCommand};
+use bpflink::{BpfUdpPacket, TransportMode};
 
 #[tokio::test]
 async fn builder_requires_interface_local_ip_and_service_ports() {
@@ -254,6 +255,62 @@ async fn configured_test_link_rejects_unconfigured_service_port() {
         err,
         Error::ServicePortNotConfigured { requested: 40008 }
     ));
+
+    let err = link.udp_socket(40008).await.unwrap_err();
+    assert!(matches!(
+        err,
+        Error::ServicePortNotConfigured { requested: 40008 }
+    ));
+}
+
+#[tokio::test]
+async fn udp_socket_is_created_from_link_and_records_sends() {
+    let link = Link::new_for_test_with_service_ports([53000]);
+    let socket = link.udp_socket(53000).await.unwrap();
+    let peer = PeerAddr {
+        ip: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53)),
+    };
+
+    socket.send_to(b"dns-query", peer, 53).await.unwrap();
+
+    assert_eq!(socket.service_port(), 53000);
+    assert_eq!(
+        link.recorded_commands(),
+        vec![
+            TestCommand::UdpSocket {
+                service_port: 53000,
+            },
+            TestCommand::UdpSend {
+                service_port: 53000,
+                peer,
+                peer_port: 53,
+                len: 9,
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_link_delivers_injected_udp_datagrams() {
+    let link = Link::new_for_test_with_service_ports([53001]);
+    let socket = link.udp_socket(53001).await.unwrap();
+    let source: SocketAddr = "192.0.2.53:53".parse().unwrap();
+
+    link.inject_udp_datagram_for_test(
+        53001,
+        BpfUdpPacket {
+            source,
+            payload: b"dns-response".to_vec(),
+        },
+    )
+    .unwrap();
+
+    let packet = socket
+        .recv_from_timeout(Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(packet.source, source);
+    assert_eq!(packet.payload, b"dns-response");
 }
 
 #[tokio::test]

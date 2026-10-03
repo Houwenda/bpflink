@@ -2,7 +2,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::socket::{BpfListener, BpfStream};
+use crate::socket::{BpfListener, BpfStream, BpfUdpSocket};
 use crate::transport::TransportMode;
 use crate::{Error, Result};
 
@@ -173,6 +173,33 @@ impl Link {
         }
 
         Err(Error::DriverClosed)
+    }
+
+    pub async fn udp_socket(&self, service_port: u16) -> Result<BpfUdpSocket> {
+        self.ensure_service_port(service_port)?;
+        #[cfg(feature = "test-util")]
+        if let Some(driver) = &self.test_driver {
+            return driver.udp_socket(service_port);
+        }
+
+        if let Some(driver) = &self.runtime_driver {
+            return driver.udp_socket(service_port).await;
+        }
+
+        Err(Error::DriverClosed)
+    }
+
+    #[cfg(feature = "test-util")]
+    pub fn inject_udp_datagram_for_test(
+        &self,
+        service_port: u16,
+        packet: crate::socket::BpfUdpPacket,
+    ) -> Result<()> {
+        self.ensure_service_port(service_port)?;
+        self.test_driver
+            .as_ref()
+            .ok_or(Error::DriverClosed)?
+            .inject_udp_datagram(service_port, packet)
     }
 
     pub async fn stats(&self) -> Result<LinkStats> {

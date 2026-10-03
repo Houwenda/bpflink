@@ -10,7 +10,8 @@ This checklist is for preparing a `bpflink` crate release candidate.
   Windows is a future support target, and other operating systems are out of
   scope.
 - Public API: `Link`, `LinkBuilder`, `PeerAddr`, `BpfStream`,
-  `BpfListener`, `TransportMode`, and diagnostics helpers.
+  `BpfListener`, `BpfUdpSocket`, `BpfUdpPacket`, `TransportMode`, and
+  diagnostics helpers.
 - Service-port API: declare the full build-time set with
   `LinkBuilder::service_ports([...])`; dynamic service-port registration is
   outside this release.
